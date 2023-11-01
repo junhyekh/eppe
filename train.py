@@ -39,13 +39,13 @@ parser.add_argument("--batch_query_size", type=int, default=256)
 parser.add_argument("--enc_base_dim", type=int, default=256)
 parser.add_argument("--dec_base_dim", type=int, default=128)
 parser.add_argument("--subpnts_no", type=int, default=256)
+parser.add_argument("--vp_dropout", type=float, default=0.5)
+
 
 args = parser.parse_args()
 
 class OccDataDirLoader(Dataset):
     def __init__(self, dataset_dir=os.path.join(BASEDIR, 'data/partial_occ'), eval_type='test'):
-        
-
         ds_dir_list = glob.glob(os.path.join(dataset_dir, '*.pkl'))
         def replace_np_ele(x, y, ns, i):
             x[i] = y
@@ -191,7 +191,7 @@ def BCE_loss(yp_logit, yt):
     return loss
 
 def cal_loss(params, ds, jkey):
-    vp_dropout_idx = jax.random.uniform(jkey, shape=(args.batch_size, args.nvp)) < 0.5
+    vp_dropout_idx = jax.random.uniform(jkey, shape=(args.batch_size, args.nvp)) < args.vp_dropout
     _, jkey = jax.random.split(jkey)
     partial_points = jnp.where(vp_dropout_idx[...,None,None,None], ds[0], 0)
     seg = jnp.where(vp_dropout_idx[...,None,None], ds[1], 0)
@@ -199,21 +199,28 @@ def cal_loss(params, ds, jkey):
     embs = enc_model.apply(params[0], partial_points, seg, jkey)
     _, jkey = jax.random.split(jkey)
     
-    embs_dropout_idx = jax.random.uniform(jkey, shape=embs[...,:1,:].shape) < 0.3
-    _, jkey = jax.random.split(jkey)
-    embs = jnp.where(embs_dropout_idx, embs, 0)
+    # embedding top-k selection
+    embs_norm = jnp.linalg.norm(embs, axis=-2)
+    nd = embs_norm.shape[-1]
+    embs_norm_topidx = -jnp.sort(-embs_norm, axis=-1)
+    embs_20 = jnp.where((embs_norm>embs_norm_topidx[...,int(nd*0.2)][...,None])[...,None,:], embs, 0)
+    embs_50 = jnp.where((embs_norm>embs_norm_topidx[...,int(nd*0.5)][...,None])[...,None,:], embs, 0)
+    embs_80 = jnp.where((embs_norm>embs_norm_topidx[...,int(nd*0.8)][...,None])[...,None,:], embs, 0)
 
     qps = einops.rearrange(ds[2], '... i j k -> ... (i j) k')
-    occ_pred = dec_model.apply(params[1], embs, qps)
+    occ_pred = dec_model.apply(params[1], embs, qps).reshape(ds[3].shape)
+    occ_pred_20 = dec_model.apply(params[1], embs_20, qps).reshape(ds[3].shape)
+    occ_pred_50 = dec_model.apply(params[1], embs_50, qps).reshape(ds[3].shape)
+    occ_pred_80 = dec_model.apply(params[1], embs_80, qps).reshape(ds[3].shape)
 
-    occ_pred = occ_pred.reshape(ds[3].shape)
+    occ_loss = jnp.mean(jnp.where(vp_dropout_idx, jnp.mean(BCE_loss(occ_pred, ds[3]), axis=-1), 0))
+    occ_loss_20 = jnp.mean(jnp.where(vp_dropout_idx, jnp.mean(BCE_loss(occ_pred_20, ds[3]), axis=-1), 0))
+    occ_loss_50 = jnp.mean(jnp.where(vp_dropout_idx, jnp.mean(BCE_loss(occ_pred_50, ds[3]), axis=-1), 0))
+    occ_loss_80 = jnp.mean(jnp.where(vp_dropout_idx, jnp.mean(BCE_loss(occ_pred_80, ds[3]), axis=-1), 0))
 
-    occ_loss = BCE_loss(occ_pred, ds[3])
-    occ_loss = jnp.where(vp_dropout_idx, jnp.mean(occ_loss, axis=-1), 0)
-    occ_loss = jnp.mean(occ_loss)
-
-    loss = occ_loss
-    return loss, {'train_occ_loss': occ_loss}
+    loss = occ_loss + occ_loss_20 + occ_loss_50 + occ_loss_80
+    return loss, {'train_occ_loss': occ_loss/args.vp_dropout, 'train_occ_loss_20': occ_loss_20/args.vp_dropout,
+                  'train_occ_loss_50': occ_loss_50/args.vp_dropout, 'train_occ_loss_80': occ_loss_80/args.vp_dropout}
 
 cal_loss_grad = jax.grad(cal_loss, has_aux=True)
 
@@ -287,8 +294,6 @@ for itr in range(10000):
         else:
             train_loss_dict = jax.tree_map(lambda x,y: x+y, train_loss_dict, train_loss_dict_)
         tr_cnt += 1
-        # if i%100==0:
-        #     print(i, train_loss_dict_)
     train_loss_dict = jax.tree_map(lambda x: x/tr_cnt, train_loss_dict)
 
     # evaluations
