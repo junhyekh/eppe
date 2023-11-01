@@ -1,0 +1,5 @@
+data/32_64_1_v4
+data/partial_occ
+logs
+__pycache__
+Wigner_D_coef.pkl
