@@ -91,7 +91,7 @@ class Encoder(nn.Module):
         x = evl.EVNResnetBlockFC(self.args, base_dim, base_dim)(x)
         x = jnp.mean(x, -3)
         x = evl.EVNNonLinearity(self.args)(x)
-        x = nn.Dense(base_dim, use_bias=False)(x)
+        x = nn.Dense(base_dim//2, use_bias=False)(x)
 
         return x
 
@@ -115,11 +115,9 @@ class Decoder(nn.Module):
         p_ext = evl.MakeHDFeature(self.args, self.rot_configs)(p[...,None]).squeeze(-1)
 
         net = (p_ext * p_ext).sum(-1, keepdims=True)
-        if self.args.model_type == 0:
-            net_z = jnp.einsum('...mf,...fd->...md', p_ext, emb_merge)
-        else:
+        if self.args.model_type == 1:
             net = einops.repeat(net, '... v p j -> ... (r v) p j', r=emb.shape[-3])
-            net_z = jnp.einsum('...mf,...fd->...md', p_ext, emb_merge)
+        net_z = jnp.einsum('...mf,...fd->...md', p_ext, emb_merge)
         z_dir = nn.Dense(emb_merge.shape[-1], use_bias=False)(emb_merge)
         z_inv = (emb_merge * z_dir).sum(-2)
         z_inv = einops.repeat(z_inv, '... b -> ... r b', r=np_)
@@ -236,10 +234,9 @@ if __name__ == '__main__':
     @jax.jit
     def occ_inf_test(params, ds, jkey, rot_aug=True):
         embs = enc_model.apply(params[0], ds[0], ds[1], jkey)
-        if args.model_type == 0:
-            qps = einops.rearrange(ds[2], '... i j k -> ... (i j) k')
-        else:
-            qps = einops.rearrange(ds[2], '... i j k -> ... (i j) k')[...,None,:,:]
+        qps = einops.rearrange(ds[2], '... i j k -> ... (i j) k')
+        if args.model_type == 1:
+            qps = qps[...,None,:,:]
         occ_pred = dec_model.apply(params[1], embs, qps)
 
         if args.model_type == 0:
