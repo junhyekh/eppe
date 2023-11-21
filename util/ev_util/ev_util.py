@@ -44,16 +44,29 @@ def get_graph_feature(x, k=20, cross=False, idx_out=False):
         return feature
 
 
-def max_norm_pooling(x:jnp.ndarray):
+def max_norm_pooling(x:jnp.ndarray, axis=-3, keepdims=False):
     '''
     (... V F D)
     
     '''
-    x_norm = jnp.linalg.norm(x, axis=-2)
-    maxv_idx = jnp.argmax(x_norm, axis=-2)
-    return jnp.take_along_axis(x, maxv_idx[...,None,None,:], -3).squeeze(-3)
+    x_norm = jnp.linalg.norm(x, axis=-2, keepdims=True) # feature dim
+    maxv_idx = jnp.argmax(x_norm, axis=axis, keepdims=True) # max axis
+    if keepdims:
+        return jnp.take_along_axis(x, maxv_idx, axis)
+    else:
+        return jnp.take_along_axis(x, maxv_idx, axis).squeeze(axis)
 
+
+def reduce_top_k_emb(x:jnp.ndarray, ratio):
+    '''
+    (... F D)
     
+    '''
+    x_norm = jnp.linalg.norm(x, axis=-2) # feature dim
+    # maxv_idx = jnp.argsort(-x_norm, axis=-1, keepdims=True) # max axis
+    embs_norm_topidx = -jnp.sort(-x_norm, axis=-1)
+    return jnp.where((x_norm>embs_norm_topidx[..., int(x.shape[-1]*ratio)][...,None])[...,None,:], x, 0)
+
 
 
 if __name__ == '__main__':

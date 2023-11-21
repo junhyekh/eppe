@@ -17,7 +17,7 @@ os.makedirs(ds_dir, exist_ok=True)
 
 p.connect(p.DIRECT)
 
-mesh_dir = glob.glob('data/32_64_1_v4/*.obj')[:100]
+mesh_dir = glob.glob('data/32_64_1_v4/*.obj')[-100:]
 pixel_size = [100,100]
 far = 2.0
 near = 0.005
@@ -82,10 +82,13 @@ for md in mesh_dir:
     qpnts_list = []
     occ_label_list = []
     for vp_idx in range(nvp):
-        qps = partial_spts_list[vp_idx][np.where(seg_list[vp_idx]>=0)]
-        nq = int(nqpnt/qps.shape[0]) + 1
-        qps = qps[...,None,:] + np.random.normal(size=(qps.shape[0], nq, 3)) * 0.01
-        qps = qps.reshape(-1,3)[:nqpnt]
+        qps_sf = partial_spts_list[vp_idx][np.where(seg_list[vp_idx]>=0)]
+        nq = int(nqpnt/qps_sf.shape[0]) + 1
+        qps = qps_sf[...,None,:] + np.random.normal(size=(qps_sf.shape[0], nq, 3)) * 0.004
+        
+        qps = qps.reshape(-1,3)
+        qps = np.random.permutation(qps)
+        qps = qps[:nqpnt]
         qps = o3d.core.Tensor(qps,
                             dtype=o3d.core.Dtype.Float32)
         ans = scene.compute_occupancy(qps)
@@ -93,6 +96,24 @@ for md in mesh_dir:
         occ_label = ans.numpy().astype(bool)
         qpnts_list.append(qps)
         occ_label_list.append(occ_label)
+
+        # # visualize points
+        # vtxpcd = o3d.geometry.PointCloud()
+        # spcd = o3d.geometry.PointCloud()
+        # qpcd = o3d.geometry.PointCloud()
+        # ipcd = o3d.geometry.PointCloud()
+        # # for idx in range(qpnts.shape[0]):
+        # vtxpcd.points = o3d.utility.Vector3dVector(qps_sf)
+        # # vtxpcd.paint_uniform_color([0.2, 1.0, 0.1])
+        # # spcd.points = o3d.utility.Vector3dVector(qps)
+        # # spcd.paint_uniform_color([1, 0.706, 0])
+        # qpcd.points = o3d.utility.Vector3dVector(qps[np.logical_not(occ_label)])
+        # ipcd.points = o3d.utility.Vector3dVector(qps[occ_label])
+        # ipcd.paint_uniform_color([0.2, 0.206, 1])
+        # mesh_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+        #     size=0.1, origin=[0, 0, 0])
+        # o3d.visualization.draw_geometries([vtxpcd, spcd, qpcd, ipcd, mesh_frame])
+        # # visualize points
 
     dpnts = (np.array(partial_spts_list).astype(np.float16), np.array(seg_list).astype(np.int32), np.array(qpnts_list).astype(np.float16), np.array(occ_label_list).astype(bool))
 
