@@ -33,7 +33,9 @@ def subsample(pnts_, seg_, subpnts_no, jkey):
     return pick_pnts, jkey
 
 # ckpt_dir = 'logs/11202023-170107/saved.pkl'
-ckpt_dir = 'logs/11012023-211835/saved.pkl'
+ckpt_dir = 'logs/11212023-153229/saved.pkl' # local representation
+# ckpt_dir = 'logs/11212023-183559/saved.pkl' # global representation
+
 
 with open(ckpt_dir, 'rb') as f:
     raw_loaded = pickle.load(f)
@@ -42,7 +44,7 @@ args = raw_loaded['args']
 rot_configs = raw_loaded['rot_configs']
 
 args.nvp = 8
-eval_dataset = DataLoader(OccDataDirLoader(eval_type='train', args=args), batch_size=16, shuffle=False, num_workers=1, drop_last=True)
+eval_dataset = DataLoader(OccDataDirLoader(eval_type='train', args=args), batch_size=4, shuffle=False, num_workers=1, drop_last=True)
 
 for ds in eval_dataset:
     ds_sample = ds
@@ -60,12 +62,6 @@ jkey = jax.random.PRNGKey(args.seed)
 enc_model = Encoder(args, rot_configs)
 dec_model = Decoder(args, rot_configs)
 
-emb, enc_params = enc_model.init_with_output(jkey, ds_sample[0], ds_sample[1], jkey)
-_, jkey = jax.random.split(jkey)
-
-qps = einops.rearrange(ds_sample[2], '... i j k -> ... (i j) k')
-dec_params = dec_model.init(jkey, emb, qps)
-
 
 # calculate relative rotations
 cem_nitr = 10
@@ -81,9 +77,7 @@ def cem(emb1, emb2, jkey, w_gt=None):
     if w_gt is not None:
         w = jax.random.normal(jkey, shape=emb1.shape[:-2] + (cem_nb,3)) + w_gt[:,None]
     else:
-        # w = jax.random.normal(jkey, shape=emb1.shape[:-2] + (cem_nb,3))
         w = tutil.q2aa(tutil.qrand(emb1.shape[:-2] + (cem_nb,)))
-        # w = jax.random.uniform(jkey, shape=emb1.shape[:-2] + (cem_nb,3), minval=-np.pi, maxval=np.pi)
     _, jkey = jax.random.split(jkey)
 
     for itr in range(cem_nitr):
@@ -94,7 +88,7 @@ def cem(emb1, emb2, jkey, w_gt=None):
         w_std = jnp.std(w_top, axis=-2, keepdims=True)
         w = w_mean + w_std*jax.random.normal(jkey, w.shape)
         _, jkey = jax.random.split(jkey)
-        print(itr, jnp.min(loss, -1))
+        # print(itr, jnp.min(loss, -1))
     
     loss = loss_func(w, emb1, emb2)
     top_idx = jnp.argmin(loss, axis=-1, keepdims=True)
@@ -157,8 +151,9 @@ for ds in eval_dataset:
     _, jkey = jax.random.split(jkey)
 
     emb_query = enc_model.apply(params[0], rot_pnts_query, seg_query, jkey)
-    emb_query = evutil.max_norm_pooling(emb_query)
-    emb_query = evutil.reduce_top_k_emb(emb_query, 0.7)
+    if args.model_type == 0:
+        emb_query = evutil.max_norm_pooling(emb_query)
+        emb_query = evutil.reduce_top_k_emb(emb_query, 0.7)
     _, jkey = jax.random.split(jkey)
 
     # for i in range(emb_query.shape[0]):
@@ -168,7 +163,6 @@ for ds in eval_dataset:
     #     plt.show()
 
     w_gt = tutil.q2aa(tutil.qinv(random_quat))
-    # w_res, jkey = cem(emb_query, emb_ref, jkey, w_gt=w_gt)
     w_res, jkey = cem(emb_query, emb_ref, jkey, w_gt=None)
 
     loss_opt = loss_func(w_res[...,None,:], emb_query, emb_ref).squeeze(-1)
@@ -176,7 +170,7 @@ for ds in eval_dataset:
     print('loss from gt')
     print(loss_opt - loss_gt)
 
-    cd = chamfer_dist(pnts_ref, rot_pnts_query, seg_ref, seg_query, w_res, jkey)
+    cd = chamfer_dist(pnts_ref, rot_pnts_query, seg_ref, seg_query, w_res, jkey, visualize=True)
     _, jkey = jax.random.split(jkey)
 
     print('chamfer_distances', cd)

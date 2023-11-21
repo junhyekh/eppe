@@ -62,8 +62,14 @@ class Encoder(nn.Module):
         base_dim = self.args.enc_base_dim
 
         # segmentation sample
-        x = einops.rearrange(x, '... i j k -> ... (i j) k')
-        seg = einops.rearrange(seg, '... i j -> ... (i j)')
+        if self.args.model_type == 0:
+            x = einops.rearrange(x, '... i j k -> ... (i j) k')
+            seg = einops.rearrange(seg, '... i j -> ... (i j)')
+            subpnts_no = self.args.subpnts_no
+        else:
+            x = einops.rearrange(x, '... v i j k -> ... (v i j) k')
+            seg = einops.rearrange(seg, '... v i j -> ... (v i j)')
+            subpnts_no = self.args.subpnts_no
         pm_idx = jnp.arange(x.shape[-2])
         pm_idx = jax.random.permutation(jkey, pm_idx)
         _, jkey = jax.random.split(jkey)
@@ -71,8 +77,8 @@ class Encoder(nn.Module):
         seg = seg[...,pm_idx]
 
         seg_flat = seg.reshape(-1, seg.shape[-1])
-        flat_idx = jax.vmap(lambda x: jnp.where(x>=0, size=self.args.subpnts_no, fill_value=-1))(seg_flat)[0]
-        flat_idx = flat_idx.reshape(seg.shape[:-1] + (self.args.subpnts_no,))
+        flat_idx = jax.vmap(lambda x: jnp.where(x>=0, size=subpnts_no, fill_value=-1))(seg_flat)[0]
+        flat_idx = flat_idx.reshape(seg.shape[:-1] + (subpnts_no,))
         x = jnp.take_along_axis(x, flat_idx[...,None], axis=-2)
         x = jnp.where(flat_idx[...,None]>=0, x, 0)
 
@@ -103,23 +109,19 @@ class Decoder(nn.Module):
     @nn.compact
     def __call__(self, emb, p):
         '''
-        emb : (... V F D)
+        emb : (... F D)
         '''
         base_dim = self.args.dec_base_dim
         np_ = p.shape[-2]
         if self.args.model_type == 0:
-            emb_merge = eutil.max_norm_pooling(emb) # (... F D)
-        else:
-            emb_merge = emb
+            emb = eutil.max_norm_pooling(emb) # (... F D)
 
         p_ext = evl.MakeHDFeature(self.args, self.rot_configs)(p[...,None]).squeeze(-1)
 
         net = (p_ext * p_ext).sum(-1, keepdims=True)
-        if self.args.model_type == 1:
-            net = einops.repeat(net, '... v p j -> ... (r v) p j', r=emb.shape[-3])
-        net_z = jnp.einsum('...mf,...fd->...md', p_ext, emb_merge)
-        z_dir = nn.Dense(emb_merge.shape[-1], use_bias=False)(emb_merge)
-        z_inv = (emb_merge * z_dir).sum(-2)
+        net_z = jnp.einsum('...mf,...fd->...md', p_ext, emb)
+        z_dir = nn.Dense(emb.shape[-1], use_bias=False)(emb)
+        z_inv = (emb * z_dir).sum(-2)
         z_inv = einops.repeat(z_inv, '... b -> ... r b', r=np_)
         net = jnp.concatenate([net, net_z, z_inv], axis=-1)
 
@@ -149,8 +151,6 @@ if __name__ == '__main__':
     _, jkey = jax.random.split(jkey)
 
     qps = einops.rearrange(ds_sample[2], '... i j k -> ... (i j) k')
-    if args.model_type == 1:
-        qps = qps[...,None,:,:]
     dec_params = dec_model.init(jkey, emb, qps)
     params = (enc_params, dec_params)
 
@@ -163,24 +163,21 @@ if __name__ == '__main__':
         return loss
 
     def cal_loss(params, ds, jkey):
-        if args.model_type == 0:
-            vp_dropout_idx = jax.random.uniform(jkey, shape=(args.batch_size, args.nvp)) < args.vp_dropout
-            _, jkey = jax.random.split(jkey)
-            partial_points = jnp.where(vp_dropout_idx[...,None,None,None], ds[0], 0)
-            seg = jnp.where(vp_dropout_idx[...,None,None], ds[1], 0)
-        else:
-            partial_points = ds[0]
-            seg = ds[1]
+        vp_dropout_idx = jax.random.uniform(jkey, shape=(args.batch_size, args.nvp)) < args.vp_dropout
+        _, jkey = jax.random.split(jkey)
+        partial_points = jnp.where(vp_dropout_idx[...,None,None,None], ds[0], 0)
+        seg = jnp.where(vp_dropout_idx[...,None,None], ds[1], 0)
 
         embs = enc_model.apply(params[0], partial_points, seg, jkey)
         _, jkey = jax.random.split(jkey)
         
+        qps = einops.rearrange(ds[2], '... i j k -> ... (i j) k')
+        loss_dict = {}
         if args.model_type == 0:
             # embedding top-k selection
             embs_norm = jnp.linalg.norm(embs, axis=-2)
             nd = embs_norm.shape[-1]
             embs_norm_topidx = -jnp.sort(-embs_norm, axis=-1)
-            qps = einops.rearrange(ds[2], '... i j k -> ... (i j) k')
             
             loss_dict = {}
             for ratio_ in [0.05, 0.1, 0.3, 0.6]:
@@ -188,16 +185,13 @@ if __name__ == '__main__':
                 occ_pred_ = dec_model.apply(params[1], embs_, qps).reshape(ds[3].shape)
                 occ_loss_ = jnp.mean(jnp.where(vp_dropout_idx, jnp.mean(BCE_loss(occ_pred_, ds[3]), axis=-1), 0))
                 loss_dict['train_occ_loss_' + str(ratio_)] = occ_loss_/args.vp_dropout
-
-            loss = jnp.sum(jnp.stack([loss_dict[k] for k in loss_dict]))
-            return loss, loss_dict
         else:
-            qps = einops.rearrange(ds[2], '... i j k -> ... (i j) k')[...,None,:,:]
-            occ_pred = dec_model.apply(params[1], embs, qps)
-            gt_occ = ds[3].reshape(ds[3].shape[0], 1, -1)
-            gt_occ = einops.repeat(gt_occ, '... i j -> ... (r i) j', r=occ_pred.shape[-2])
-            occ_loss = jnp.mean(BCE_loss(occ_pred, gt_occ))
-            return occ_loss, {}
+            occ_pred = dec_model.apply(params[1], embs, qps).reshape(ds[3].shape)
+            occ_loss_ = jnp.mean(BCE_loss(occ_pred, ds[3]))
+            loss_dict['train_occ_loss'] = occ_loss_
+        
+        loss = jnp.sum(jnp.stack([loss_dict[k] for k in loss_dict]))
+        return loss, loss_dict
 
     cal_loss_grad = jax.grad(cal_loss, has_aux=True)
 
@@ -235,17 +229,9 @@ if __name__ == '__main__':
     def occ_inf_test(params, ds, jkey, rot_aug=True):
         embs = enc_model.apply(params[0], ds[0], ds[1], jkey)
         qps = einops.rearrange(ds[2], '... i j k -> ... (i j) k')
-        if args.model_type == 1:
-            qps = qps[...,None,:,:]
         occ_pred = dec_model.apply(params[1], embs, qps)
-
-        if args.model_type == 0:
-            occ_pred = occ_pred.reshape(ds[3].shape)
-            gt_occ = ds[3]
-        else:
-            gt_occ = ds[3].reshape(ds[3].shape[0], 1, -1)
-            gt_occ = einops.repeat(gt_occ, '... i j -> ... (r i) j', r=occ_pred.shape[-2])
-
+        occ_pred = occ_pred.reshape(ds[3].shape)
+        gt_occ = ds[3]
         occ_loss = BCE_loss(occ_pred, gt_occ)
 
         return occ_pred, occ_loss
@@ -291,10 +277,7 @@ if __name__ == '__main__':
             ds = jax.tree_map(lambda x: jnp.asarray(x), ds)
             occ_pred, occ_loss_ = occ_inf_test(params, ds, jkey)
             eval_occ_loss += occ_loss_
-            if args.model_type == 0:
-                gt_occ = ds[3]
-            else:
-                gt_occ = ds[3].reshape(ds[3].shape[0], -1)[:,None,:]
+            gt_occ = ds[3]
             occ_acc += jnp.sum(jnp.logical_and(occ_pred>0, gt_occ>0.5)) + jnp.sum(jnp.logical_and(occ_pred<0, gt_occ<0.5))
             total_occ += occ_pred.shape[0] * occ_pred.shape[1] * occ_pred.shape[2]
         cur_occ_acc = occ_acc/total_occ
