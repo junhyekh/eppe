@@ -8,6 +8,7 @@ import numpy as np
 import einops
 import matplotlib.pyplot as plt
 import open3d as o3d
+from scipy.spatial.transform import Rotation as R
 
 BASEDIR = os.path.dirname(__file__)
 if BASEDIR not in sys.path:
@@ -111,7 +112,7 @@ def chamfer_dist(ref_pnts, query_pnts, ref_seg, query_seg, w, jkey, visualize=Fa
 
     if visualize:
         for i in range(ref_pnts.shape[0]):
-            print((loss_opt - loss_gt)[i])
+            # print((loss_opt - loss_gt)[i])
             pcd_ref = o3d.geometry.PointCloud()
             pcd_ref.points = o3d.utility.Vector3dVector(np.array(ref_pnts_ss[i]))
             pcd_ref.paint_uniform_color(np.array([0.1,0.2,1]))
@@ -129,6 +130,7 @@ def chamfer_dist(ref_pnts, query_pnts, ref_seg, query_seg, w, jkey, visualize=Fa
     # return 0.5*jnp.mean(jnp.sort(jnp.sqrt(jnp.min(sq_dif,axis=-1)),axis=-1)[...,-5:], axis=-1) + \
     #     0.5*jnp.mean(jnp.sort(jnp.sqrt(jnp.min(sq_dif,axis=-2)),axis=-1)[...,-5:], axis=-1)
 
+USE_ICP = True
 
 # start calculate rotation
 nv_query = 1
@@ -155,6 +157,74 @@ for ds in eval_dataset:
         emb_query = evutil.max_norm_pooling(emb_query)
         emb_query = evutil.reduce_top_k_emb(emb_query, 0.7)
     _, jkey = jax.random.split(jkey)
+
+    if USE_ICP:
+        # ICP between pnts_ref, seg_ref & rot_pnts_query, seg_query
+        pnts_ref_o3d = np.array(pnts_ref) # (B, 7, 100, 100, 3)
+        seg_ref_o3d = np.array(seg_ref) # (B, 7, 100, 100)
+        rot_pnts_query_o3d = np.array(rot_pnts_query) # (B, 1, 100, 100, 3)
+        seg_query_o3d = np.array(seg_query) # (B, 1, 100, 100)
+
+        random_q = tutil.qrand((len(pnts_ref_o3d),), jkey)
+        _, jkey = jax.random.split(jkey)
+        random_rotmat = tutil.q2R(random_q)
+        random_rotmat = np.array(random_rotmat)
+        est_aa_list = []
+
+        for cur_idx in range(len(pnts_ref_o3d)):
+            pnts_ref_cur = pnts_ref_o3d[cur_idx].reshape(-1, 3)
+            seg_ref_cur  = seg_ref_o3d[cur_idx].reshape(-1)   
+            pnts_ref_cur_pure = np.take_along_axis(pnts_ref_cur, np.argwhere(seg_ref_cur==0), axis=0)
+
+            pnts_rot_cur = rot_pnts_query_o3d[cur_idx].reshape(-1, 3)
+            seg_rot_cur  = seg_query_o3d[cur_idx].reshape(-1)
+            pnts_rot_cur_pure = np.take_along_axis(pnts_rot_cur, np.argwhere(seg_rot_cur==0), axis=0)
+
+            print(1)
+
+            source = o3d.geometry.PointCloud()
+            target = o3d.geometry.PointCloud()
+            source.points = o3d.utility.Vector3dVector(pnts_ref_cur_pure)
+            target.points = o3d.utility.Vector3dVector(pnts_rot_cur_pure)
+
+            # Apply ICP
+            threshold = 0.05  # Set this to an appropriate value depending on your data
+            trans_init = np.eye(4)
+            trans_init[:3, :3] = random_rotmat[cur_idx]
+
+            relative_fitness = 0.000001
+            relative_rmse = 0.000001
+            max_iteration = 1000
+
+            # Estimate normal
+            target.estimate_normals()
+
+            reg_p2p = o3d.pipelines.registration.registration_generalized_icp(
+                    source, target, threshold, trans_init,
+                    # o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+                    # o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                    o3d.pipelines.registration.TransformationEstimationForGeneralizedICP(),
+                    o3d.pipelines.registration.ICPConvergenceCriteria(relative_fitness,
+                                            relative_rmse,
+                                            max_iteration))
+
+            # Return the transformation matrix
+            transf_matrix = reg_p2p.transformation
+            fitness = reg_p2p.fitness
+            inlier_rmse = reg_p2p.inlier_rmse
+            estimated_rot = transf_matrix[:3, :3].copy()
+            estimated_quat = R.from_matrix(estimated_rot).as_quat()
+            est_aa = tutil.aa2q(jnp.array(estimated_quat))
+
+            est_aa_list.append(est_aa)
+
+        est_aa_list = jnp.stack(est_aa_list, axis=0)
+
+        cd_icp = chamfer_dist(pnts_ref, rot_pnts_query, seg_ref, seg_query,\
+                            est_aa_list, jkey, visualize=True)
+        _, jkey = jax.random.split(jkey)
+
+        print('chamfer_distances of ICP', cd_icp)
 
     # for i in range(emb_query.shape[0]):
     #     plt.figure()
